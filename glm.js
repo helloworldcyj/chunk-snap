@@ -8,39 +8,66 @@ const SVG_INVALID_XML_CHARS = /[\u0000-\u0008\v\f\u000E-\u001F\uD800-\uDFFF\uFFF
 // iOS 上 Chrome/Edge 也是 WebKit 内核（CriOS/EdgiOS 不含 "Chrome/" 标记）
 const isWebKit = () => /AppleWebKit/i.test(navigator.userAgent) && !/Chrome\/|Chromium\//.test(navigator.userAgent)
 
+const logErr = (stage, e) => {
+  console.error(`[Screenshot] ${stage}失败:`, e)
+  console.error(`[Screenshot] ${stage}失败详情: name=${e?.name ?? '-'} code=${String(e?.code ?? '-')} stack=${e?.stack ?? '-'}`)
+}
+
 /**
  * 接管「切片 SVG → 位图」环节：显式 decode + 双帧稳定后再绘制。
- * WebKit 专属兜底：data: URL 加载失败时降级 Blob URL（无长度限制）；
- * 切片含内嵌资源（data: 图片/字体）时延时重绘，对齐库的 fixSvgXmlDecode
+ * WebKit 专属处理：
+ * - Blob URL 优先（data: 兜底）：规避超长 data: URL 的加载限制，也避免
+ *   宿主 App 劫持 img.src 的拦截器解析大 data: URL 时抛错
+ * - img.src 赋值同步抛出（懒加载 SDK 劫持 setter）时自动换 URL 类型重试
+ * - 切片含内嵌资源（data: 图片/字体）时延时重绘，对齐库的 fixSvgXmlDecode
  */
 async function renderSvgToCanvas(wrapper, width, height, scale) {
-  const svg = await domToForeignObjectSvg(wrapper, { width, height })
-  let svgStr = new XMLSerializer().serializeToString(svg)
-  svgStr = svgStr.replace(SVG_INVALID_XML_CHARS, '')
+  let svgStr
+  try {
+    const svg = await domToForeignObjectSvg(wrapper, { width, height })
+    svgStr = new XMLSerializer().serializeToString(svg)
+    svgStr = svgStr.replace(SVG_INVALID_XML_CHARS, '')
+  } catch (e) {
+    logErr('SVG 构建/序列化 (stage=svg-build) ', e)
+    throw e
+  }
   const canvas = document.createElement('canvas')
   canvas.width = Math.floor(width * scale)
   canvas.height = Math.floor(height * scale)
   const ctx = canvas.getContext('2d', { willReadFrequently: true })
 
   const sizeInfo = `svg=${(svgStr.length / 1024).toFixed(0)}KB`
-  const load = (url) => new Promise((resolve, reject) => {
+  const dataUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svgStr)}`
+  let blobUrl = null
+  const load = (url, kind) => new Promise((resolve, reject) => {
     const img = new Image()
     img.decoding = 'sync'
     img.loading = 'eager'
-    img.onload = () => resolve(img)
-    img.onerror = () => reject(new Error(`SVG image decode failed (${sizeInfo}, url=${(url.length / 1024).toFixed(0)}KB)`))
-    img.src = url
+    const timer = setTimeout(() => reject(new Error(`SVG image load timeout (${kind}, ${sizeInfo})`)), 10000)
+    img.onload = () => { clearTimeout(timer); resolve(img) }
+    img.onerror = () => { clearTimeout(timer); reject(new Error(`SVG image decode failed (${kind}, ${sizeInfo})`)) }
+    try {
+      img.src = url
+    } catch (e) {
+      clearTimeout(timer)
+      reject(new Error(`img.src 同步抛出 (${kind}, ${sizeInfo}): name=${e?.name ?? '-'} code=${String(e?.code ?? '-')} ${e?.message ?? e}`))
+    }
   })
 
-  let img
-  let blobUrl = null
-  try {
-    img = await load(`data:image/svg+xml;charset=utf-8,${encodeURIComponent(svgStr)}`)
-  } catch (e) {
-    // iOS/WebKit 对超长 data: URL 可能直接加载失败：降级 Blob URL
-    blobUrl = URL.createObjectURL(new Blob([svgStr], { type: 'image/svg+xml;charset=utf-8' }))
-    img = await load(blobUrl)
+  let img = null
+  let lastErr = null
+  for (const kind of (isWebKit() ? ['blob', 'data'] : ['data', 'blob'])) {
+    if (kind === 'blob' && !blobUrl) {
+      blobUrl = URL.createObjectURL(new Blob([svgStr], { type: 'image/svg+xml;charset=utf-8' }))
+    }
+    try {
+      img = await load(kind === 'blob' ? blobUrl : dataUrl, kind)
+      break
+    } catch (e) {
+      lastErr = e
+    }
   }
+  if (!img) throw lastErr ?? new Error(`SVG image load failed (${sizeInfo})`)
   try {
     await img.decode().catch(() => {})
     await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))
@@ -305,6 +332,9 @@ export async function safeExportLongImage(sourceEl, fileName = 'screenshot.png')
             }
           }
         }
+      } catch (e) {
+        logErr(`切片 y=${top}-${bottom} 渲染`, e)
+        throw e
       } finally {
         wrapper.remove()
       }
@@ -329,7 +359,7 @@ export async function safeExportLongImage(sourceEl, fileName = 'screenshot.png')
 
     return finalCanvas
   } catch (error) {
-    console.error('[Screenshot] 导出失败:', error)
+    logErr('导出', error)
     alert('生成图片失败，请重试')
     throw error
   }
