@@ -1,28 +1,61 @@
 import { domToForeignObjectSvg } from 'modern-screenshot'
 
 /**
+ * WebKit 的 XML 解析器严格：非法控制字符 / 未配对代理对会直接 decode 失败
+ * （Chromium 宽容）。对齐库 svgToDataUrl 的 removeControlCharacter 默认行为
+ */
+const SVG_INVALID_XML_CHARS = /[\u0000-\u0008\v\f\u000E-\u001F\uD800-\uDFFF\uFFFE-\uFFFF]/gu
+// iOS 上 Chrome/Edge 也是 WebKit 内核（CriOS/EdgiOS 不含 "Chrome/" 标记）
+const isWebKit = () => /AppleWebKit/i.test(navigator.userAgent) && !/Chrome\/|Chromium\//.test(navigator.userAgent)
+
+/**
  * 接管「切片 SVG → 位图」环节：显式 decode + 双帧稳定后再绘制。
- * modern-screenshot 的 fixSvgXmlDecode 只对 Safari/Firefox 做重绘兜底，
- * 这里对所有环境统一 decode 纪律，规避 WebKit 的首次绘制不稳。
+ * WebKit 专属兜底：data: URL 加载失败时降级 Blob URL（无长度限制）；
+ * 切片含内嵌资源（data: 图片/字体）时延时重绘，对齐库的 fixSvgXmlDecode
  */
 async function renderSvgToCanvas(wrapper, width, height, scale) {
   const svg = await domToForeignObjectSvg(wrapper, { width, height })
-  const svgStr = new XMLSerializer().serializeToString(svg)
-  const dataUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svgStr)}`
+  let svgStr = new XMLSerializer().serializeToString(svg)
+  svgStr = svgStr.replace(SVG_INVALID_XML_CHARS, '')
   const canvas = document.createElement('canvas')
   canvas.width = Math.floor(width * scale)
   canvas.height = Math.floor(height * scale)
   const ctx = canvas.getContext('2d', { willReadFrequently: true })
-  const img = new Image()
-  img.decoding = 'sync'
-  await new Promise((resolve, reject) => {
-    img.onload = resolve
-    img.onerror = () => reject(new Error('SVG image decode failed'))
-    img.src = dataUrl
+
+  const sizeInfo = `svg=${(svgStr.length / 1024).toFixed(0)}KB`
+  const load = (url) => new Promise((resolve, reject) => {
+    const img = new Image()
+    img.decoding = 'sync'
+    img.loading = 'eager'
+    img.onload = () => resolve(img)
+    img.onerror = () => reject(new Error(`SVG image decode failed (${sizeInfo}, url=${(url.length / 1024).toFixed(0)}KB)`))
+    img.src = url
   })
-  await img.decode().catch(() => {})
-  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))
-  ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
+
+  let img
+  let blobUrl = null
+  try {
+    img = await load(`data:image/svg+xml;charset=utf-8,${encodeURIComponent(svgStr)}`)
+  } catch (e) {
+    // iOS/WebKit 对超长 data: URL 可能直接加载失败：降级 Blob URL
+    blobUrl = URL.createObjectURL(new Blob([svgStr], { type: 'image/svg+xml;charset=utf-8' }))
+    img = await load(blobUrl)
+  }
+  try {
+    await img.decode().catch(() => {})
+    await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
+    // WebKit 首绘可能空白：内嵌资源解码滞后于图像本体，延时重绘
+    if (isWebKit() && /(?:src|href)="data:|url\(["']?data:/.test(svgStr)) {
+      for (let i = 0; i < 2; i++) {
+        await new Promise(r => setTimeout(r, 100))
+        ctx.clearRect(0, 0, canvas.width, canvas.height)
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
+      }
+    }
+  } finally {
+    if (blobUrl) URL.revokeObjectURL(blobUrl)
+  }
   return canvas
 }
 
