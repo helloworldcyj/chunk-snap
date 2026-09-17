@@ -16,7 +16,8 @@ const logErr = (stage, e) => {
 /**
  * 接管「切片 SVG → 位图」环节：显式 decode + 双帧稳定后再绘制。
  * WebKit 专属处理：
- * - Blob URL 优先（data: 兜底）：规避超长 data: URL 的加载限制，也避免
+ * - WebKit 必须使用 data: URL：blob: + foreignObject 会污染 canvas，导致像素读取报 SecurityError
+ * - 非 WebKit 仍保留 blob: 兜底：规避超长 data: URL 的加载限制，也避免
  *   宿主 App 劫持 img.src 的拦截器解析大 data: URL 时抛错
  * - img.src 赋值同步抛出（懒加载 SDK 劫持 setter）时自动换 URL 类型重试
  * - 切片含内嵌资源（data: 图片/字体）时延时重绘，对齐库的 fixSvgXmlDecode
@@ -56,7 +57,7 @@ async function renderSvgToCanvas(wrapper, width, height, scale) {
 
   let img = null
   let lastErr = null
-  for (const kind of (isWebKit() ? ['blob', 'data'] : ['data', 'blob'])) {
+  for (const kind of (isWebKit() ? ['data'] : ['data', 'blob'])) {
     if (kind === 'blob' && !blobUrl) {
       blobUrl = URL.createObjectURL(new Blob([svgStr], { type: 'image/svg+xml;charset=utf-8' }))
     }
