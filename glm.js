@@ -1,11 +1,45 @@
-import { domToCanvas } from 'modern-screenshot'
+import { domToForeignObjectSvg } from 'modern-screenshot'
+
+/**
+ * 接管「切片 SVG → 位图」环节：显式 decode + 双帧稳定后再绘制。
+ * modern-screenshot 的 fixSvgXmlDecode 只对 Safari/Firefox 做重绘兜底，
+ * 这里对所有环境统一 decode 纪律，规避 WebKit 的首次绘制不稳。
+ */
+async function renderSvgToCanvas(wrapper, width, height, scale) {
+  const svg = await domToForeignObjectSvg(wrapper, { width, height })
+  const svgStr = new XMLSerializer().serializeToString(svg)
+  const dataUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svgStr)}`
+  const canvas = document.createElement('canvas')
+  canvas.width = Math.floor(width * scale)
+  canvas.height = Math.floor(height * scale)
+  const ctx = canvas.getContext('2d', { willReadFrequently: true })
+  const img = new Image()
+  img.decoding = 'sync'
+  await new Promise((resolve, reject) => {
+    img.onload = resolve
+    img.onerror = () => reject(new Error('SVG image decode failed'))
+    img.src = dataUrl
+  })
+  await img.decode().catch(() => {})
+  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
+  return canvas
+}
+
 
 /** iOS 单个 Canvas 的安全像素上限（约 4096 * 4096） */
 export const IOS_MAX_CANVAS_PIXELS = 16777216
 const SAFETY_RATIO = 0.85
-/** 单个切片 DOM 的最大高度：直接限制每次序列化进 foreignObject 的 DOM 体量 */
-const MAX_SLICE_HEIGHT = 2000
-/** 切片 + 上下跨界子节点，单次序列化面积约为切片的 3 倍 */
+/**
+ * 单个切片 DOM 的最大高度。除 iOS 序列化体量约束外，还必须低于
+ * GPU 光栅损坏带的首带位置（实测 ~205px，见下方说明）：部分 Chromium+GPU
+ * 环境（本机 Intel UHD / RTX 3050，Chrome/Edge 有头模式实测）对较高的
+ * SVG foreignObject 图像按 ~280px 瓦片光栅化，瓦片边界处 ~20px 内容带
+ * 被整体位移，且损坏与内容复杂度、会话状态相关、无法用校准图预测。
+ * 损坏带锚定在各图自身内容顶部 ~205px 起每 280px 一条，切片高度压到
+ * 205px 之下即可让画布与损坏带永不相交，对所有环境免疫。
+ */
+const MAX_SLICE_HEIGHT = 200
 const STRADDLE_FACTOR = 3
 
 function isInlineLevel(node) {
@@ -162,7 +196,8 @@ export async function safeExportLongImage(sourceEl, fileName = 'screenshot.png')
     finalScale = Math.min(1, Math.sqrt((IOS_MAX_CANVAS_PIXELS * SAFETY_RATIO) / totalPixels))
   }
 
-  // 2. 切片高度：每个切片的 DOM 面积（含跨界子节点）与切片 canvas 都落在安全区
+  // 2. 切片高度：每个切片的 DOM 面积（含跨界子节点）与切片 canvas 都落在安全区。
+  //    MAX_SLICE_HEIGHT=200 同时低于 GPU 光栅损坏首带位置（~205px），见常量说明
   const sliceHeight = Math.max(1, Math.min(
     height,
     MAX_SLICE_HEIGHT,
@@ -174,7 +209,7 @@ export async function safeExportLongImage(sourceEl, fileName = 'screenshot.png')
   const finalCanvas = document.createElement('canvas')
   finalCanvas.width = Math.round(width * finalScale)
   finalCanvas.height = Math.round(height * finalScale)
-  const ctx = finalCanvas.getContext('2d')
+  const ctx = finalCanvas.getContext('2d', { willReadFrequently: true })
 
   const bg = getComputedStyle(sourceEl).backgroundColor
   if (bg && bg !== 'transparent' && bg !== 'rgba(0, 0, 0, 0)') {
@@ -186,6 +221,13 @@ export async function safeExportLongImage(sourceEl, fileName = 'screenshot.png')
   globalThis.__TEST__?.onFinalCanvas?.(finalCanvas, { width, height, finalScale, sliceHeight })
 
   try {
+    // 4. 合成：不使用 drawImage 把 chunk 拼贴到大画布——有头 GPU 模式下 Chrome
+    //    对大画布忽略 willReadFrequently 提示，GPU 瓦片边界会产生 ~20px 内容
+    //    位移（实测 8515px 画布在 245.3+280k 处稳定复现）。改用 ImageData 纯
+    //    像素搬运：memcpy 不经过光栅化，与画布后端无关
+    const finalData = ctx.getImageData(0, 0, finalCanvas.width, finalCanvas.height)
+    const fbuf = finalData.data
+    const fw = finalCanvas.width
     for (let top = 0; top < height; top += sliceHeight) {
       const bottom = Math.min(top + sliceHeight, height)
 
@@ -204,20 +246,37 @@ export async function safeExportLongImage(sourceEl, fileName = 'screenshot.png')
       mount.appendChild(wrapper)
 
       try {
-        const chunkCanvas = await domToCanvas(wrapper, {
-          width,
-          height: bottom - top,
-          scale: finalScale,
-        })
-
-        // 4. 用取整后的区间铺画，杜绝切片之间出现 1px 缝隙
+        const chunkCanvas = await renderSvgToCanvas(wrapper, width, bottom - top, finalScale)
+        const cdata = chunkCanvas.getContext('2d', { willReadFrequently: true })
+          .getImageData(0, 0, chunkCanvas.width, chunkCanvas.height)
+        const cbuf = cdata.data
+        const cw = cdata.width, ch = cdata.height
+        // 取整后的区间铺画，杜绝切片之间出现 1px 缝隙；≤1px 的拉伸用最近邻
         const yTop = Math.round(top * finalScale)
         const yBottom = Math.round(bottom * finalScale)
-        ctx.drawImage(chunkCanvas, 0, yTop, finalCanvas.width, yBottom - yTop)
+        const destH = yBottom - yTop
+        for (let dy = 0; dy < destH; dy++) {
+          const sy = ch === 1 ? 0 : Math.min(ch - 1, Math.floor(dy * ch / destH))
+          const fRow = (yTop + dy) * fw * 4
+          const cRow = sy * cw * 4
+          if (cw === fw) {
+            fbuf.set(cbuf.subarray(cRow, cRow + cw * 4), fRow)
+          } else {
+            for (let dx = 0; dx < fw; dx++) {
+              const sx = Math.min(cw - 1, Math.floor(dx * cw / fw))
+              const fo = fRow + dx * 4, co = cRow + sx * 4
+              fbuf[fo] = cbuf[co]
+              fbuf[fo + 1] = cbuf[co + 1]
+              fbuf[fo + 2] = cbuf[co + 2]
+              fbuf[fo + 3] = cbuf[co + 3]
+            }
+          }
+        }
       } finally {
         wrapper.remove()
       }
     }
+    ctx.putImageData(finalData, 0, 0)
 
     // 5. 导出无损 Blob 并触发下载
     await new Promise((resolve, reject) => {
